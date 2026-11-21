@@ -3,7 +3,19 @@ import time
 import openvino_genai as ov_genai
 import json
 from datetime import datetime
+from pydantic import BaseModel
+from pydantic import ValidationError
+from typing import Literal
+from pydantic import TypeAdapter
 
+class ToolCall(BaseModel):
+    tool: Literal["check_time"]
+
+class Answer(BaseModel):
+    answer: str
+
+Reply = TypeAdapter(ToolCall | Answer)
+REPLY_REGEX = r'\{"tool": "check_time"\}|\{"answer": "([^"\\\n]|\\.)*"\}'
 MODEL = "models/qwen3-1.7b-int4"
 SYSTEM = """You are a helpful, concise assistant. Sometimes you need to do the calculation or get any information from somewhere.
 For that you can use tool call. Some of the tools are:
@@ -11,7 +23,8 @@ Check Time: [name: check_time, description: It is the tool which get current tim
 For tool calling you have to answer it in JSON and just give answer in that Schema
 SCHEMA: "{"tool": "check_time"} if you want to use get the exact time.
 Only use tools when required based on the user input.
-If tools calling is not required answer normally without JSON
+If tools calling is not required answer in JSON but use {"answer": "<Your reply>"}
+
 """
 
 
@@ -31,6 +44,7 @@ def main():
     config.max_new_tokens = 512
     config.do_sample = False
     config.temperature = 0.8
+    config.structured_output_config = ov_genai.StructuredOutputConfig(regex=REPLY_REGEX)
     tools = {"check_time": check_time}
 
     # The conversation so far. The model sees all of it every turn.
@@ -72,11 +86,10 @@ def main():
         # /no_think turns off Qwen3's thinking mode, so it answers directly
         history.append({"role": "user", "content": user + " /no_think"})
 
-        
         print("bot> ", end="", flush=True)
         start = time.perf_counter()
         
-        result = pipe.generate(history, config, stream)
+        result = pipe.generate(history, config)
         m = result.perf_metrics
         tokenPerSecond = m.get_throughput().mean
         ttft = m.get_ttft().mean
@@ -91,21 +104,27 @@ def main():
             reply = reply.split("</think>", 1)[1].strip()
         history.append({"role": "assistant", "content": reply})
         try:
-            data = json.loads(reply)
-            name = data["tool"]
-            tool_result = tools[name]()
-            print(f"Tool result: {tool_result} ")
-            history.append({"role": "user", "content": f"Tool result: {tool_result}"})
-            print("bot> ", end="", flush=True)
-            result = pipe.generate(history, config, stream)
-            reply = result.texts[0]
-            if "</think>" in reply:
-                reply = reply.split("</think>", 1)[1].strip()
-            history.append({"role": "assistant", "content": reply})
-            print()
-                
-        except (json.JSONDecodeError, KeyError):
-            pass
+            parsed = Reply.validate_json(reply)
+            if isinstance(parsed, ToolCall):
+                tool_result = tools[parsed.tool]()
+                print(f"Tool check_time -> {tool_result} ")
+                history.append({"role": "user", "content": f"Tool result: {tool_result}"})
+                print("bot> ", end="", flush=True)
+                result = pipe.generate(history, config)
+                reply = result.texts[0]
+                if "</think>" in reply:
+                    reply = reply.split("</think>", 1)[1].strip()
+                history.append({"role": "assistant", "content": reply})
+                parsed = Reply.validate_json(reply)
+
+            if isinstance(parsed, Answer):
+                print(parsed.answer)
+            else:
+                print("(the model asked for a tool again, stopping here)")
+
+        except ValidationError:
+            print("(could not read the model's reply)")
+            print(repr(reply))
         print(f"\n({seconds:.1f}s), Token Per Second: {tokenPerSecond:.0f}, TTFT: {ttft:.0f}\n")
         
 
